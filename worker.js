@@ -7,38 +7,38 @@ export default {
   async fetch(request) {
     const upgrade = request.headers.get("Upgrade");
 
-    console.log("REQUEST:", request.method, request.url);
-    console.log("UPGRADE:", upgrade);
-
     // Normal browser request
     if (upgrade !== "websocket") {
-      return new Response("VLESS Worker", { status: 200 });
+      return new Response("VLESS Worker OK", {
+        status: 200,
+      });
     }
 
     const url = new URL(request.url);
 
     if (url.pathname !== PATH) {
-      console.log("BAD PATH:", url.pathname);
-      return new Response("Not Found", { status: 404 });
+      return new Response("Not Found", {
+        status: 404,
+      });
     }
 
-    console.log("WEBSOCKET REQUEST RECEIVED");
+    const pair = new WebSocketPair();
 
-    const webSocketPair = new WebSocketPair();
-    const client = webSocketPair[0];
-    const server = webSocketPair[1];
+    const client = pair[0];
+    const server = pair[1];
 
-    // Explicitly receive binary WebSocket frames as ArrayBuffer.
+    // Support both ArrayBuffer and Blob.
     server.binaryType = "arraybuffer";
 
     server.accept({
       allowHalfOpen: true,
     });
 
-    console.log("WEBSOCKET ACCEPTED");
-
-    handleVless(server).catch((error) => {
-      console.error("HANDLE ERROR:", error?.stack || error);
+    handleConnection(request, server).catch((error) => {
+      console.error(
+        "CONNECTION ERROR:",
+        error?.stack || error
+      );
 
       try {
         server.close(1011, "Internal error");
@@ -52,199 +52,499 @@ export default {
   },
 };
 
-async function handleVless(ws) {
-  let socket = null;
-  let writer = null;
-  let initialized = false;
+async function handleConnection(request, ws) {
+  console.log("VLESS CONNECTION START");
 
-  console.log("WAITING FOR VLESS MESSAGE");
+  /*
+   * Some VLESS clients can put the first VLESS packet
+   * inside Sec-WebSocket-Protocol as early data.
+   */
+  const earlyDataHeader =
+    request.headers.get("sec-websocket-protocol") || "";
 
-  const firstMessage = await new Promise((resolve, reject) => {
-    const onMessage = (event) => {
-      console.log("MESSAGE RECEIVED");
-
-      if (typeof event.data === "string") {
-        console.log("MESSAGE TYPE: STRING");
-        reject(new Error("VLESS message was text"));
-        return;
-      }
-
-      let data;
-
-      if (event.data instanceof ArrayBuffer) {
-        data = new Uint8Array(event.data);
-      } else if (event.data instanceof Blob) {
-        event.data.arrayBuffer().then((buffer) => {
-          resolve(new Uint8Array(buffer));
-        }).catch(reject);
-
-        return;
-      } else {
-        reject(new Error("Unknown WebSocket message type"));
-        return;
-      }
-
-      console.log("MESSAGE SIZE:", data.length);
-
-      resolve(data);
-    };
-
-    ws.addEventListener("message", onMessage, { once: true });
-
-    ws.addEventListener(
-      "close",
-      () => reject(new Error("WebSocket closed before VLESS message")),
-      { once: true }
-    );
-
-    ws.addEventListener(
-      "error",
-      () => reject(new Error("WebSocket error before VLESS message")),
-      { once: true }
-    );
-  });
-
-  console.log(
-    "FIRST BYTES:",
-    Array.from(firstMessage.slice(0, 12))
-      .map((x) => x.toString(16).padStart(2, "0"))
-      .join(" ")
+  const readable = makeWebSocketStream(
+    ws,
+    earlyDataHeader
   );
 
-  const requestInfo = parseVlessRequest(firstMessage);
+  const reader = readable.getReader();
 
-  console.log(
-    "VLESS TARGET:",
-    requestInfo.hostname + ":" + requestInfo.port
-  );
+  /*
+   * Read enough data to contain the complete VLESS header.
+   * We don't assume that the whole header arrives in one
+   * WebSocket frame.
+   */
 
-  console.log("VLESS INITIAL PAYLOAD:", requestInfo.payload.length);
+  let buffer = new Uint8Array(0);
 
-  // Connect to requested TCP destination.
-  console.log("CONNECTING TCP...");
+  let requestInfo = null;
 
-  try {
-    socket = connect({
-      hostname: requestInfo.hostname,
-      port: requestInfo.port,
-    });
+  while (!requestInfo) {
+    const { value, done } = await reader.read();
 
-    await socket.opened;
-
-    console.log("TCP CONNECTED");
-  } catch (error) {
-    console.error("TCP CONNECTION FAILED:", error?.stack || error);
-
-    try {
-      ws.close(1011, "TCP connection failed");
-    } catch {}
-
-    return;
-  }
-
-  initialized = true;
-
-  // VLESS response header.
-  ws.send(new Uint8Array([0, 0]));
-
-  console.log("VLESS RESPONSE SENT");
-
-  // Keep one writer for the WebSocket -> TCP direction.
-  writer = socket.writable.getWriter();
-
-  try {
-    // Send the data that came after the VLESS header.
-    if (requestInfo.payload.length > 0) {
-      await writer.write(requestInfo.payload);
-
-      console.log(
-        "INITIAL PAYLOAD SENT:",
-        requestInfo.payload.length
+    if (done) {
+      throw new Error(
+        "WebSocket closed before VLESS request"
       );
     }
 
-    // TCP -> WebSocket
-    const tcpToWs = relayTcpToWebSocket(socket, ws);
+    const chunk = await toUint8Array(value);
 
-    // WebSocket -> TCP
-    const wsToTcp = relayWebSocketToTcp(ws, writer);
+    if (!chunk || chunk.length === 0) {
+      continue;
+    }
 
-    await Promise.all([tcpToWs, wsToTcp]);
-  } catch (error) {
-    console.error("RELAY ERROR:", error?.stack || error);
-  } finally {
-    if (initialized) {
-      console.log("CONNECTION CLOSED");
+    console.log(
+      "VLESS DATA RECEIVED:",
+      chunk.length,
+      "bytes"
+    );
+
+    buffer = concatUint8Arrays(buffer, chunk);
+
+    if (buffer.length > 65536) {
+      throw new Error(
+        "VLESS header is too large"
+      );
     }
 
     try {
-      writer.releaseLock();
-    } catch {}
+      requestInfo = parseVlessHeader(buffer);
+    } catch (error) {
+      /*
+       * If the data is simply incomplete, keep reading.
+       * Otherwise propagate the real protocol error.
+       */
+      if (
+        error?.message === "INCOMPLETE_VLESS_HEADER"
+      ) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  console.log(
+    "VLESS TARGET:",
+    requestInfo.hostname +
+      ":" +
+      requestInfo.port
+  );
+
+  console.log(
+    "VLESS PAYLOAD:",
+    requestInfo.payload.length,
+    "bytes"
+  );
+
+  /*
+   * Connect to the requested TCP destination.
+   */
+  console.log("CONNECTING TCP...");
+
+  const socket = connect({
+    hostname: requestInfo.hostname,
+    port: requestInfo.port,
+  });
+
+  await socket.opened;
+
+  console.log("TCP CONNECTED");
+
+  const writer =
+    socket.writable.getWriter();
+
+  /*
+   * VLESS response header.
+   */
+  ws.send(
+    new Uint8Array([
+      0x00,
+      0x00,
+    ])
+  );
+
+  console.log(
+    "VLESS RESPONSE SENT"
+  );
+
+  /*
+   * Send any data that was already included
+   * after the VLESS header.
+   */
+  if (requestInfo.payload.length > 0) {
+    await writer.write(
+      requestInfo.payload
+    );
+
+    console.log(
+      "INITIAL DATA SENT:",
+      requestInfo.payload.length
+    );
+  }
+
+  /*
+   * Continue receiving data from WebSocket
+   * and send it to TCP.
+   */
+  const wsToTcp = relayWebSocketToTcp(
+    reader,
+    writer
+  );
+
+  /*
+   * Receive TCP data and send it to WebSocket.
+   */
+  const tcpToWs = relayTcpToWebSocket(
+    socket,
+    ws
+  );
+
+  await Promise.race([
+    wsToTcp,
+    tcpToWs,
+  ]);
+
+  try {
+    writer.releaseLock();
+  } catch {}
+
+  try {
+    await socket.close();
+  } catch {}
+
+  try {
+    ws.close();
+  } catch {}
+
+  console.log(
+    "VLESS CONNECTION CLOSED"
+  );
+}
+
+
+/* =========================================================
+   WebSocket -> ReadableStream
+   ========================================================= */
+
+function makeWebSocketStream(
+  ws,
+  earlyDataHeader
+) {
+  let cancelled = false;
+
+  return new ReadableStream({
+    start(controller) {
+
+      ws.addEventListener(
+        "message",
+        (event) => {
+
+          if (cancelled) {
+            return;
+          }
+
+          controller.enqueue(
+            event.data
+          );
+        }
+      );
+
+      ws.addEventListener(
+        "close",
+        () => {
+
+          if (cancelled) {
+            return;
+          }
+
+          cancelled = true;
+
+          try {
+            controller.close();
+          } catch {}
+        }
+      );
+
+      ws.addEventListener(
+        "error",
+        (error) => {
+
+          if (cancelled) {
+            return;
+          }
+
+          cancelled = true;
+
+          try {
+            controller.error(error);
+          } catch {}
+        }
+      );
+
+      /*
+       * WebSocket Early Data
+       */
+      if (earlyDataHeader) {
+
+        try {
+
+          const decoded =
+            base64UrlDecode(
+              earlyDataHeader
+            );
+
+          if (decoded.length > 0) {
+            controller.enqueue(decoded);
+          }
+
+        } catch (error) {
+
+          console.error(
+            "EARLY DATA ERROR:",
+            error
+          );
+        }
+      }
+    },
+
+    cancel() {
+      cancelled = true;
+
+      try {
+        ws.close();
+      } catch {}
+    },
+  });
+}
+
+
+/* =========================================================
+   WebSocket -> TCP
+   ========================================================= */
+
+async function relayWebSocketToTcp(
+  reader,
+  writer
+) {
+  try {
+
+    while (true) {
+
+      const {
+        value,
+        done,
+      } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      const data =
+        await toUint8Array(value);
+
+      if (
+        data &&
+        data.length > 0
+      ) {
+
+        await writer.write(data);
+
+        console.log(
+          "WS -> TCP:",
+          data.length,
+          "bytes"
+        );
+      }
+    }
+
+  } catch (error) {
+
+    console.error(
+      "WS -> TCP ERROR:",
+      error?.stack || error
+    );
+
+    throw error;
+  }
+}
+
+
+/* =========================================================
+   TCP -> WebSocket
+   ========================================================= */
+
+async function relayTcpToWebSocket(
+  socket,
+  ws
+) {
+  const reader =
+    socket.readable.getReader();
+
+  try {
+
+    while (true) {
+
+      const {
+        value,
+        done,
+      } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      if (
+        value &&
+        value.length > 0
+      ) {
+
+        if (
+          ws.readyState !==
+          WebSocket.OPEN
+        ) {
+          break;
+        }
+
+        ws.send(value);
+
+        console.log(
+          "TCP -> WS:",
+          value.length,
+          "bytes"
+        );
+      }
+    }
+
+  } finally {
 
     try {
-      await socket.close();
-    } catch {}
-
-    try {
-      ws.close();
+      reader.releaseLock();
     } catch {}
   }
 }
 
-function parseVlessRequest(data) {
-  console.log("PARSING VLESS REQUEST");
+
+/* =========================================================
+   VLESS HEADER
+   ========================================================= */
+
+function parseVlessHeader(
+  data
+) {
+  /*
+   * Minimum possible VLESS TCP header:
+   *
+   * 1  version
+   * 16 UUID
+   * 1  addons length
+   * 1  command
+   * 2  port
+   * 1  address type
+   * 4  IPv4
+   *
+   * = 26 bytes
+   */
 
   if (data.length < 24) {
-    throw new Error("VLESS header too short");
-  }
-
-  // Version
-  if (data[0] !== 0x00) {
     throw new Error(
-      "Unsupported VLESS version: " + data[0]
+      "INCOMPLETE_VLESS_HEADER"
     );
   }
 
-  // UUID
-  const uuidBytes = hexToBytes(UUID.replaceAll("-", ""));
+  /*
+   * Version
+   */
+
+  if (data[0] !== 0x00) {
+    throw new Error(
+      "INVALID_VLESS_VERSION"
+    );
+  }
+
+  /*
+   * UUID
+   */
+
+  const uuidBytes =
+    uuidToBytes(UUID);
 
   for (let i = 0; i < 16; i++) {
-    if (data[1 + i] !== uuidBytes[i]) {
-      throw new Error("Invalid UUID");
+
+    if (
+      data[1 + i] !==
+      uuidBytes[i]
+    ) {
+      throw new Error(
+        "INVALID_UUID"
+      );
     }
   }
 
-  console.log("UUID OK");
+  console.log(
+    "UUID VERIFIED"
+  );
 
   let offset = 17;
 
-  // Addons length
-  const addonsLength = data[offset++];
+  /*
+   * Addons length
+   */
 
-  console.log("ADDONS LENGTH:", addonsLength);
-
-  if (data.length < offset + addonsLength + 4) {
-    throw new Error("Invalid VLESS addon section");
-  }
-
-  // Skip addons
-  offset += addonsLength;
-
-  // Command
-  const command = data[offset++];
-
-  console.log("COMMAND:", command);
-
-  // 1 = TCP
-  if (command !== 1) {
+  if (data.length < offset + 1) {
     throw new Error(
-      "Unsupported VLESS command: " + command
+      "INCOMPLETE_VLESS_HEADER"
     );
   }
 
-  // Port
+  const addonsLength =
+    data[offset];
+
+  offset += 1;
+
+  /*
+   * Skip addons.
+   */
+
+  if (
+    data.length <
+    offset + addonsLength + 1
+  ) {
+    throw new Error(
+      "INCOMPLETE_VLESS_HEADER"
+    );
+  }
+
+  offset += addonsLength;
+
+  /*
+   * Command
+   *
+   * 1 = TCP
+   * 2 = UDP
+   */
+
+  const command =
+    data[offset];
+
+  offset += 1;
+
+  if (command !== 1) {
+
+    throw new Error(
+      "ONLY_TCP_SUPPORTED"
+    );
+  }
+
+  /*
+   * Port
+   */
+
   if (data.length < offset + 2) {
-    throw new Error("Missing port");
+    throw new Error(
+      "INCOMPLETE_VLESS_HEADER"
+    );
   }
 
   const port =
@@ -253,80 +553,144 @@ function parseVlessRequest(data) {
 
   offset += 2;
 
-  console.log("PORT:", port);
+  /*
+   * Address type
+   *
+   * 1 = IPv4
+   * 2 = Domain
+   * 3 = IPv6
+   */
 
-  // Address type
   if (data.length < offset + 1) {
-    throw new Error("Missing address type");
+    throw new Error(
+      "INCOMPLETE_VLESS_HEADER"
+    );
   }
 
-  const addressType = data[offset++];
+  const addressType =
+    data[offset];
 
-  console.log("ADDRESS TYPE:", addressType);
+  offset += 1;
 
   let hostname;
 
-  // IPv4
+  /*
+   * IPv4
+   */
+
   if (addressType === 1) {
+
     if (data.length < offset + 4) {
-      throw new Error("Invalid IPv4 address");
+      throw new Error(
+        "INCOMPLETE_VLESS_HEADER"
+      );
     }
 
-    hostname = Array.from(
-      data.slice(offset, offset + 4)
-    ).join(".");
+    hostname =
+      Array.from(
+        data.slice(
+          offset,
+          offset + 4
+        )
+      ).join(".");
 
     offset += 4;
   }
 
-  // Domain
+  /*
+   * Domain
+   */
+
   else if (addressType === 2) {
+
     if (data.length < offset + 1) {
-      throw new Error("Missing domain length");
+      throw new Error(
+        "INCOMPLETE_VLESS_HEADER"
+      );
     }
 
-    const length = data[offset++];
+    const length =
+      data[offset];
 
-    if (data.length < offset + length) {
-      throw new Error("Invalid domain");
+    offset += 1;
+
+    if (
+      data.length <
+      offset + length
+    ) {
+      throw new Error(
+        "INCOMPLETE_VLESS_HEADER"
+      );
     }
 
-    hostname = new TextDecoder().decode(
-      data.slice(offset, offset + length)
-    );
+    hostname =
+      new TextDecoder().decode(
+        data.slice(
+          offset,
+          offset + length
+        )
+      );
 
     offset += length;
   }
 
-  // IPv6
+  /*
+   * IPv6
+   */
+
   else if (addressType === 3) {
+
     if (data.length < offset + 16) {
-      throw new Error("Invalid IPv6 address");
+      throw new Error(
+        "INCOMPLETE_VLESS_HEADER"
+      );
     }
 
     const parts = [];
 
-    for (let i = 0; i < 16; i += 2) {
+    for (
+      let i = 0;
+      i < 16;
+      i += 2
+    ) {
+
+      const part =
+        (data[offset + i] << 8) |
+        data[offset + i + 1];
+
       parts.push(
-        (
-          (data[offset + i] << 8) |
-          data[offset + i + 1]
-        ).toString(16)
+        part.toString(16)
       );
     }
 
-    hostname = parts.join(":");
+    hostname =
+      parts.join(":");
 
     offset += 16;
   }
 
   else {
+
     throw new Error(
-      "Unsupported address type: " + addressType
+      "INVALID_ADDRESS_TYPE"
     );
   }
 
-  console.log("HOSTNAME:", hostname);
+  if (!hostname) {
+    throw new Error(
+      "EMPTY_HOSTNAME"
+    );
+  }
+
+  console.log(
+    "HOST:",
+    hostname
+  );
+
+  console.log(
+    "PORT:",
+    port
+  );
 
   return {
     hostname,
@@ -335,114 +699,116 @@ function parseVlessRequest(data) {
   };
 }
 
-async function relayTcpToWebSocket(socket, ws) {
-  console.log("TCP -> WEBSOCKET RELAY STARTED");
 
-  const reader = socket.readable.getReader();
+/* =========================================================
+   Helpers
+   ========================================================= */
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-
-      if (done) {
-        console.log("TCP STREAM ENDED");
-        break;
-      }
-
-      if (value && value.length > 0) {
-        console.log(
-          "TCP -> WS:",
-          value.length,
-          "bytes"
-        );
-
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(value);
-        } else {
-          break;
-        }
-      }
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {}
+async function toUint8Array(
+  value
+) {
+  if (!value) {
+    return new Uint8Array(0);
   }
+
+  if (
+    value instanceof Uint8Array
+  ) {
+    return value;
+  }
+
+  if (
+    value instanceof ArrayBuffer
+  ) {
+    return new Uint8Array(value);
+  }
+
+  if (
+    value instanceof Blob
+  ) {
+    const buffer =
+      await value.arrayBuffer();
+
+    return new Uint8Array(buffer);
+  }
+
+  throw new Error(
+    "UNKNOWN_WEBSOCKET_DATA_TYPE"
+  );
 }
 
-async function relayWebSocketToTcp(ws, writer) {
-  console.log("WEBSOCKET -> TCP RELAY STARTED");
 
-  return new Promise((resolve, reject) => {
-    const onMessage = async (event) => {
-      try {
-        let data;
-
-        if (event.data instanceof ArrayBuffer) {
-          data = new Uint8Array(event.data);
-        } else if (event.data instanceof Blob) {
-          data = new Uint8Array(
-            await event.data.arrayBuffer()
-          );
-        } else {
-          console.log("IGNORED TEXT MESSAGE");
-          return;
-        }
-
-        console.log(
-          "WS -> TCP:",
-          data.length,
-          "bytes"
-        );
-
-        if (data.length > 0) {
-          await writer.write(data);
-        }
-      } catch (error) {
-        console.error(
-          "WS -> TCP ERROR:",
-          error?.stack || error
-        );
-
-        cleanup();
-        reject(error);
-      }
-    };
-
-    const onClose = () => {
-      console.log("WEBSOCKET CLOSED");
-
-      cleanup();
-      resolve();
-    };
-
-    const onError = () => {
-      console.error("WEBSOCKET ERROR");
-
-      cleanup();
-      reject(new Error("WebSocket error"));
-    };
-
-    function cleanup() {
-      ws.removeEventListener("message", onMessage);
-      ws.removeEventListener("close", onClose);
-      ws.removeEventListener("error", onError);
-    }
-
-    ws.addEventListener("message", onMessage);
-    ws.addEventListener("close", onClose);
-    ws.addEventListener("error", onError);
-  });
-}
-
-function hexToBytes(hex) {
-  const result = new Uint8Array(hex.length / 2);
-
-  for (let i = 0; i < result.length; i++) {
-    result[i] = parseInt(
-      hex.substr(i * 2, 2),
-      16
+function concatUint8Arrays(
+  a,
+  b
+) {
+  const result =
+    new Uint8Array(
+      a.length + b.length
     );
+
+  result.set(a, 0);
+  result.set(b, a.length);
+
+  return result;
+}
+
+
+function uuidToBytes(
+  uuid
+) {
+  const hex =
+    uuid.replaceAll("-", "");
+
+  const result =
+    new Uint8Array(16);
+
+  for (
+    let i = 0;
+    i < 16;
+    i++
+  ) {
+
+    result[i] =
+      parseInt(
+        hex.substr(i * 2, 2),
+        16
+      );
+  }
+
+  return result;
+}
+
+
+function base64UrlDecode(
+  input
+) {
+  let value =
+    input
+      .replaceAll("-", "+")
+      .replaceAll("_", "/");
+
+  while (
+    value.length % 4 !== 0
+  ) {
+    value += "=";
+  }
+
+  const binary =
+    atob(value);
+
+  const result =
+    new Uint8Array(
+      binary.length
+    );
+
+  for (
+    let i = 0;
+    i < binary.length;
+    i++
+  ) {
+    result[i] =
+      binary.charCodeAt(i);
   }
 
   return result;
