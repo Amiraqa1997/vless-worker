@@ -226,5 +226,4 @@ function hexToBytes(hex) {
 
   return result;
       }
-// first cloudflare deploy
 // cloudflare trigger
