@@ -2,6 +2,10 @@
   "name": "amiraqa",
   "main": "worker.js",
   "compatibility_date": "2026-10-03",
+  "vars": {
+    "UUID": "2ed36262-3716-46dd-878d-442661ab1dbd",
+    "PROXYIP": "cdn.xn--b6gac.eu.org"
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
