@@ -18,11 +18,13 @@ export default {
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
-    server.accept();
+    server.accept({ allowHalfOpen: true });
 
-    handleWebSocket(server).catch(() => {
+    handleWebSocket(server).catch((error) => {
+      console.error("VLESS error:", error);
+
       try {
-        server.close();
+        server.close(1011, "VLESS error");
       } catch {}
     });
 
@@ -93,7 +95,7 @@ async function handleWebSocket(ws) {
     throw new Error("Only TCP is supported");
   }
 
-  if (data.length < offset + 4) {
+  if (data.length < offset + 2) {
     throw new Error("Invalid port");
   }
 
@@ -109,9 +111,17 @@ async function handleWebSocket(ws) {
       throw new Error("Invalid IPv4");
     }
 
-    hostname = Array.from(data.slice(offset, offset + 4)).join(".");
+    hostname = Array.from(
+      data.slice(offset, offset + 4)
+    ).join(".");
+
     offset += 4;
+
   } else if (addressType === 2) {
+    if (data.length <= offset) {
+      throw new Error("Invalid domain length");
+    }
+
     const length = data[offset++];
 
     if (data.length < offset + length) {
@@ -123,6 +133,7 @@ async function handleWebSocket(ws) {
     );
 
     offset += length;
+
   } else if (addressType === 3) {
     if (data.length < offset + 16) {
       throw new Error("Invalid IPv6");
@@ -132,60 +143,91 @@ async function handleWebSocket(ws) {
 
     for (let i = 0; i < 16; i += 2) {
       parts.push(
-        ((data[offset + i] << 8) | data[offset + i + 1]).toString(16)
+        ((data[offset + i] << 8) |
+          data[offset + i + 1]).toString(16)
       );
     }
 
     hostname = parts.join(":");
     offset += 16;
+
   } else {
     throw new Error("Unsupported address type");
   }
 
-  const socket = connect({
-    hostname,
-    port,
-  });
+  console.log(`Connecting to ${hostname}:${port}`);
 
-  await socket.opened;
+  let socket;
 
+  try {
+    socket = connect({
+      hostname,
+      port,
+    });
+
+    await socket.opened;
+
+    console.log(`Connected to ${hostname}:${port}`);
+  } catch (error) {
+    console.error(
+      `TCP connection failed ${hostname}:${port}`,
+      error
+    );
+
+    throw error;
+  }
+
+  // VLESS response
   ws.send(new Uint8Array([0, 0]));
 
+  // Send any payload that arrived with the VLESS header.
   const initialPayload = data.slice(offset);
 
   if (initialPayload.length > 0) {
-    await socket.writable.getWriter().write(initialPayload);
+    const writer = socket.writable.getWriter();
+
+    try {
+      await writer.write(initialPayload);
+    } finally {
+      writer.releaseLock();
+    }
   }
 
-  relaySocketToWebSocket(socket, ws);
-  relayWebSocketToSocket(socket, ws);
+  await Promise.all([
+    relaySocketToWebSocket(socket, ws),
+    relayWebSocketToSocket(socket, ws),
+  ]);
 }
 
 async function relaySocketToWebSocket(socket, ws) {
   try {
     const reader = socket.readable.getReader();
 
-    while (true) {
-      const { value, done } = await reader.read();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
 
-      if (done) break;
+        if (done) break;
 
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(value);
-      } else {
-        break;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(value);
+        } else {
+          break;
+        }
       }
+    } finally {
+      reader.releaseLock();
     }
+  } catch (error) {
+    console.error("Socket → WebSocket error:", error);
 
-    reader.releaseLock();
-  } catch {
     try {
       ws.close();
     } catch {}
   }
 }
 
-function relayWebSocketToSocket(socket, ws) {
+async function relayWebSocketToSocket(socket, ws) {
   ws.addEventListener("message", async (event) => {
     try {
       let data;
@@ -193,17 +235,24 @@ function relayWebSocketToSocket(socket, ws) {
       if (event.data instanceof ArrayBuffer) {
         data = new Uint8Array(event.data);
       } else if (event.data instanceof Blob) {
-        data = new Uint8Array(await event.data.arrayBuffer());
+        data = new Uint8Array(
+          await event.data.arrayBuffer()
+        );
       } else {
         return;
       }
 
       const writer = socket.writable.getWriter();
 
-      await writer.write(data);
+      try {
+        await writer.write(data);
+      } finally {
+        writer.releaseLock();
+      }
 
-      writer.releaseLock();
-    } catch {
+    } catch (error) {
+      console.error("WebSocket → Socket error:", error);
+
       try {
         ws.close();
       } catch {}
@@ -221,9 +270,11 @@ function hexToBytes(hex) {
   const result = new Uint8Array(hex.length / 2);
 
   for (let i = 0; i < result.length; i++) {
-    result[i] = parseInt(hex.substr(i * 2, 2), 16);
+    result[i] = parseInt(
+      hex.substr(i * 2, 2),
+      16
+    );
   }
 
   return result;
-      }
-// cloudflare trigger
+}
